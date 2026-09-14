@@ -10,6 +10,10 @@ Tested on a **PlayStation 5 Pro**, Plex app `1.007.001`, Plex Media Server `1.43
 The same path applies to any client with a minimal TLS stack — Xbox, Roku, older Android TV,
 LG webOS — they behave identically here.
 
+> **Before anything else, update Plex Media Server.** This guide documents server behaviour as of
+> September 2026. If Plex has since changed how it builds the certificate chain, a plain update is
+> the whole fix.
+
 ---
 
 ## Start here: match your symptom
@@ -19,14 +23,15 @@ You probably arrived with one specific thing on screen. Find it below.
 | What you're seeing | What it means | Go to |
 |---|---|---|
 | **"Remote Playback requires a Remote Watch Pass"** — on your own home network | The console never established a local connection and fell back to the remote one | [§1 — do this first](#1-do-this-first) |
-| Server is listed but marked **Remote** / **Віддалений** | Same cause as above | [§1](#1-do-this-first) |
+| Server is listed but marked **Remote** | Same cause as above | [§1](#1-do-this-first) |
 | **Works on browser and phone, fails only on the console** | Classic signature of this whole situation | [§1](#1-do-this-first), then [§3 for why](#3-why-this-happens) |
 | `tlsv1 alert unknown ca` in the server log | The console rejected the server's certificate — the chain is incomplete | [§2 — confirm it](#2-confirming-you-are-in-the-right-place) |
 | `CERT: incomplete TLS handshake from <console-ip>` | Same line, same cause | [§2](#2-confirming-you-are-in-the-right-place) |
 | Console **doesn't see the server at all** | May be something else entirely — check the chain first | [§2](#2-confirming-you-are-in-the-right-place) |
 | You already changed DNS on the console and nothing happened | Expected — DNS is not the cause here | [§4 — things that don't work](#4-what-not-to-do) |
 | You already set up your own certificate and the paywall stayed | Also expected, and it's by design | [§4](#4-what-not-to-do) |
-| It worked before and broke on its own | Certificate rotation — same fix | [§8](#8-after-certificate-rotation) |
+| It worked before and broke on its own | Certificate rotation — same path | [§8](#8-after-certificate-rotation) |
+| You deleted the certificate and now the server has none | You hit the rate limit — restore the backup | [§5](#5-the-one-thing-that-can-actually-hurt-you) |
 
 Short version: **a certificate chain problem shows up as a billing problem.** That disconnect is why
 this is so hard to search for.
@@ -35,27 +40,44 @@ this is so hard to search for.
 
 ## 1. Do this first
 
-If your console shows `unknown ca` in the server log, or asks for a Remote Watch Pass on your own
-LAN, this is almost certainly it:
+Plex caches its `plex.direct` certificate on disk. Deleting it makes the server request a fresh one —
+this time with a complete chain.
+
+**Where the cache lives:**
+
+| Setup | Path |
+|---|---|
+| Docker (`linuxserver/plex`) — on the host | `<your-volume>/Library/Application Support/Plex Media Server/Cache/` |
+| Docker — inside the container | `/config/Library/Application Support/Plex Media Server/Cache/` |
+| Linux (native package) | `/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Cache/` |
+| macOS | `~/Library/Caches/PlexMediaServer/` |
+| Windows | `%LOCALAPPDATA%\Plex Media Server\Cache\` |
+
+The file is `cert-v2.p12` on current versions, `certificate.p12` on older ones. Remove whichever
+exists — and **back it up first**, you will want it if anything goes wrong.
 
 ```bash
-# Docker (linuxserver/plex) — adjust the path to your config volume
 CACHE="./config/plex/Library/Application Support/Plex Media Server/Cache"
 
 docker compose stop plex
-cp "$CACHE/cert-v2.p12" "$CACHE/cert-v2.p12.bak"      # back up first
-rm -f "$CACHE/cert-v2.p12" "$CACHE/certificate.p12" "$CACHE/ca.crt"
+
+# back up whatever is there
+for f in cert-v2.p12 certificate.p12; do
+  [ -f "$CACHE/$f" ] && cp -a "$CACHE/$f" "$CACHE/$f.bak"
+done
+
+rm -f "$CACHE/cert-v2.p12" "$CACHE/certificate.p12"
 docker compose up -d plex
 ```
 
-Older servers name the file `certificate.p12`, newer ones `cert-v2.p12` — remove whichever exists.
-On restart Plex requests a fresh certificate, this time with a complete chain.
-
-> **Run this once.** See [§5](#5-the-one-thing-that-can-actually-hurt-you) before you consider
-> repeating it.
+> **Run this once.** Each deletion triggers a re-issue, and repeating it hits a Let's Encrypt rate
+> limit that leaves you with no certificate at all. Read [§5](#5-the-one-thing-that-can-actually-hurt-you)
+> before you consider a second attempt.
 
 Then reopen Plex on the console. If it remembers the old state, sign out and back in via
 `plex.tv/link`.
+
+Verify the result with [§6](#6-verifying-the-result) before assuming it worked.
 
 ---
 
@@ -72,34 +94,57 @@ Symptoms that point here:
 CERT: incomplete TLS handshake from 192.168.1.50:62749: tlsv1 alert unknown ca (SSL routines)
 ```
 
-Confirm it in one command — look at what your server actually sends:
+### Find your plex.direct hostname
+
+Every server has its own 32-character hash. Ask the server itself:
 
 ```bash
-HASH=<the 32-hex string from your plex.direct hostname>
-IP_DASHED=192-168-1-100          # your server's LAN IP, dots replaced with dashes
+openssl s_client -connect <server-ip>:32400 </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject
+# subject=CN=*.01c00d0663104e03b8de1fa2a2b4baf5.plex.direct
+#             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this is your hash
+```
+
+Your local hostname is then your LAN IP with dots replaced by dashes, plus that hash:
+`192-168-1-100.<hash>.plex.direct`
+
+### Inspect the chain
+
+```bash
+HASH=01c00d0663104e03b8de1fa2a2b4baf5      # yours, from above
+IP_DASHED=192-168-1-100                     # your server's LAN IP, dashed
 
 openssl s_client -connect <server-ip>:32400 \
   -servername $IP_DASHED.$HASH.plex.direct -showcerts </dev/null 2>/dev/null \
   | grep -E '^ [0-9] s:|^   i:'
 ```
 
-**Two certificates = this guide applies:**
+**Two certificates — this guide applies to you:**
 
 ```
  0 s:CN=*.<hash>.plex.direct
- 1 s:C=US, O=Let's Encrypt, CN=YR1
+   i:C=US, O=Let's Encrypt, CN=YR2
+ 1 s:C=US, O=Let's Encrypt, CN=YR2
+   i:C=US, O=ISRG, CN=Root YR
 ```
 
-**Three certificates, the last issued by ISRG Root X1 = your chain is already fine**, and your
+The chain stops at `Root YR`, which no client trusts on its own.
+
+**Three certificates, the last one issued by `ISRG Root X1` — your chain is already fine**, and your
 problem is something else.
+
+The intermediate may be `YR1`, `YR2` or `YR3` (or the `YE*` family for ECDSA keys) — what matters is
+where the chain *ends*, not which intermediate signed the leaf.
 
 ---
 
 ## 3. Why this happens
 
 On **2026-05-13** Let's Encrypt switched its default issuance profile to the
-[Generation Y hierarchy](https://letsencrypt.org/2025/11/24/gen-y-hierarchy.html). Plex acts as an
-ACME client for `*.plex.direct`, so it began receiving certificates from it automatically.
+[Generation Y hierarchy](https://letsencrypt.org/2025/11/24/gen-y-hierarchy.html). Plex obtains
+certificates for `*.plex.direct` on your server's behalf — Plex Media Server generates a key and
+uploads a CSR to plex.tv, and plex.tv gets the certificate from the CA and hands it back — so servers
+started receiving certificates from the new hierarchy automatically.
 
 The new roots — **ISRG Root YR** and **ISRG Root YE** — are not yet present in any trust store;
 Let's Encrypt says so directly on its [Chains of Trust](https://letsencrypt.org/certificates/) page.
@@ -119,9 +164,13 @@ When only the first two are sent, a client has nothing to anchor the path to.
 
 ### Why only consoles and TVs are affected
 
-Windows, macOS, iOS and Android perform **AIA chasing** — if an intermediate is missing they fetch it
-themselves via the Authority Information Access extension. Minimal TLS stacks in consoles and smart
-TVs do not: they expect the complete chain from the server and fail closed with `unknown ca`.
+Windows, macOS and iOS perform **AIA chasing** — if a link is missing they fetch it themselves via
+the Authority Information Access extension. Minimal TLS stacks in consoles and smart TVs do not: they
+expect the complete chain from the server and fail closed with `unknown ca`.
+
+Android's system TrustManager does *not* do AIA chasing either — Plex's mobile apps appear to ship
+their own trust anchors, which is the likely reason they keep working. Either way, the console has no
+such escape hatch.
 
 That is why the browser on your PC works while the PS5 Pro three metres away does not.
 
@@ -184,19 +233,42 @@ No DNS resolution takes place. A domain is not an IP literal, so it can never be
 no matter where it points or how it is spelled. No Preferences.xml setting changes this;
 `LanNetworksBandwidth` affects only server-side bandwidth accounting.
 
-And issuing your own certificate for `plex.direct` is impossible by design: its CAA record is
-`issue ";"`, which forbids issuance by every CA.
+Getting your own certificate for `plex.direct` is not an option either. Its CAA record reads:
+
+```
+0 issue ";"
+0 issuewild "letsencrypt.org"
+0 issuewild "digicert.com"
+```
+
+Non-wildcard issuance is forbidden to every CA, and wildcard issuance is restricted to two — neither
+of which will issue to you, since proving control over the domain requires access to Plex's DNS zone.
 
 ---
 
 ## 5. The one thing that can actually hurt you
 
 Each deletion of the certificate triggers a re-issue. Repeat it several times and you hit
-**HTTP 429** from Let's Encrypt, leaving the server with **no certificate at all**. Plex support
-cannot lift that limit — it belongs to Let's Encrypt. People have broken their TLS this way while
-debugging.
+**HTTP 429**, leaving the server with **no certificate at all**. The limit belongs to the CA — Plex
+can reset its own counters, but not the CA's. Reports on the Plex forum suggest waiting roughly a
+week. People have broken their TLS this way while debugging.
 
-**Delete once. If it doesn't help, investigate — don't retry.**
+**Delete once. If it doesn't help, go to [§7](#7-if-the-quick-fix-doesnt-help) — don't retry.**
+
+### If you already have no certificate
+
+Put the backup from §1 back:
+
+```bash
+CACHE="./config/plex/Library/Application Support/Plex Media Server/Cache"
+
+docker compose stop plex
+cp -a "$CACHE/cert-v2.p12.bak" "$CACHE/cert-v2.p12"    # or certificate.p12.bak
+docker compose up -d plex
+```
+
+This restores the *old, incomplete* chain — the console still won't work, but the server is
+serviceable for every other client while you wait out the limit.
 
 Docker users: make sure `Cache/` lives on a **persistent volume**. If it is ephemeral, the
 certificate is destroyed on every container restart, which guarantees hitting the rate limit sooner
@@ -237,7 +309,8 @@ grep -c 'incomplete TLS handshake from <console-ip>' \
 **Playback is genuinely local** — start a film and check the session:
 
 ```bash
-curl -s "http://<server-ip>:32400/status/sessions?X-Plex-Token=<token>" | grep -oE 'local="[01]"'
+curl -s -H "X-Plex-Token: <token>" "http://<server-ip>:32400/status/sessions" \
+  | grep -oE 'local="[01]"'
 # want: local="1"
 ```
 
@@ -245,28 +318,57 @@ curl -s "http://<server-ip>:32400/status/sessions?X-Plex-Token=<token>" | grep -
 
 ## 7. If the quick fix doesn't help
 
-You can repair the chain by hand: extract the certificate, append the cross-signature, repackage.
-The p12 password is derived deterministically from the machine identifier.
+Some servers re-issue and still get a truncated chain. You can repair it by hand: extract the
+certificate and key, append the cross-signature yourself, repackage. The p12 password is derived
+deterministically from the machine identifier.
 
 ```bash
-PREFS="<config>/Library/Application Support/Plex Media Server/Preferences.xml"
-MID=$(sed -n 's/.*ProcessedMachineIdentifier="\([^"]*\)".*/\1/p' "$PREFS")
+umask 077        # the private key is about to be written in the clear
+
+P="<config>/Library/Application Support/Plex Media Server"
+MID=$(sed -n 's/.*ProcessedMachineIdentifier="\([^"]*\)".*/\1/p' "$P/Preferences.xml")
 PASS=$(printf '%s' "plex${MID}" | openssl dgst -sha512 | cut -d' ' -f2)   # printf, not echo
 
-P12="<config>/Library/Application Support/Plex Media Server/Cache/cert-v2.p12"
-openssl pkcs12 -in "$P12" -passin "pass:$PASS" -nodes -nocerts -out key.pem
-openssl pkcs12 -in "$P12" -passin "pass:$PASS" -nodes -nokeys  -out leafchain.pem
+openssl pkcs12 -in "$P/Cache/cert-v2.p12" -passin "pass:$PASS" -nodes -nocerts -out key.pem
+openssl pkcs12 -in "$P/Cache/cert-v2.p12" -passin "pass:$PASS" -nodes -nokeys  -out leafchain.pem
 
-curl -sO https://letsencrypt.org/certs/gen-y/root-yr-by-x1.pem
-cat leafchain.pem root-yr-by-x1.pem > fullchain.pem
+curl -fsSLO https://letsencrypt.org/certs/gen-y/root-yr-by-x1.pem
 
+# leafchain.pem already holds leaf + intermediate; -certfile adds ONLY the missing cross-signature
 openssl pkcs12 -export -out fixed.p12 -in leafchain.pem -inkey key.pem \
-  -certfile fullchain.pem -passout "pass:$PASS" \
+  -certfile root-yr-by-x1.pem -passout "pass:$PASS" \
   -certpbe AES-256-CBC -keypbe AES-256-CBC -macalg SHA256
 ```
 
-The three `-certpbe / -keypbe / -macalg` flags are mandatory — PMS cannot read the file without them.
-Note that PMS overwrites this file on rotation (~90 days), so this needs a timer to survive.
+Check you got exactly three certificates, not five:
+
+```bash
+openssl pkcs12 -in fixed.p12 -passin "pass:$PASS" -nokeys -info 2>/dev/null \
+  | grep -c "BEGIN CERTIFICATE"
+# want: 3
+```
+
+Then install it:
+
+```bash
+docker compose stop plex
+cp -a "$P/Cache/cert-v2.p12" "$P/Cache/cert-v2.p12.bak"
+cp fixed.p12 "$P/Cache/cert-v2.p12"
+chown 1000:1000 "$P/Cache/cert-v2.p12"      # match PUID/PGID of your container
+chmod 600 "$P/Cache/cert-v2.p12"
+docker compose up -d plex
+
+shred -u key.pem 2>/dev/null || rm -f key.pem
+```
+
+Verify with [§6](#6-verifying-the-result).
+
+Notes:
+
+- On **OpenSSL 1.1.1 and older** the `-certpbe / -keypbe / -macalg` flags are mandatory — without
+  them PMS cannot read the file. On OpenSSL 3.x they are already the defaults, but harmless to keep.
+- PMS **overwrites this file** when the certificate rotates (~90 days), so this needs a timer to
+  survive. See [§8](#8-after-certificate-rotation).
 
 It is also worth reporting to Plex: the fix on their side is simply to include `root-yr-by-x1.pem`
 in the served chain, which would resolve it for every affected device at once.
@@ -283,8 +385,8 @@ reappearing:
 CERT: incomplete TLS handshake from <console-ip>: tlsv1 alert unknown ca
 ```
 
-Check the chain with the command from §2 — and remember the rate limit before deleting
-anything.
+Check the chain with the command from [§2](#2-confirming-you-are-in-the-right-place) — and remember
+the rate limit before deleting anything.
 
 ---
 
@@ -296,6 +398,7 @@ anything.
 - [Plex forum — PS5 Local Connection Failing (unknown ca)](https://forums.plex.tv/t/ps5-local-connection-failing-cert-incomplete-tls-handshake-unknown-ca-all-other-devices-work/940263)
 - [Plex forum — PS5 cannot connect to local Plex server](https://forums.plex.tv/t/ps5-cannot-connect-to-local-plex-server-tls-handshake-fails-unknown-ca/940811)
 - [Plex forum — Certificate stuck on 429](https://forums.plex.tv/t/certificate-stuck-on-429-request-reset-certs-issued-but-not-stored-cause-fixed/942464)
+- [Plex forum — Decrypting the plex.direct certificate](https://forums.plex.tv/t/decrypting-the-plex-direct-certificate/566027)
 - [Plex Support — Network settings](https://support.plex.tv/articles/200430283-network/)
 - [How Plex is doing HTTPS for all its users](https://words.filippo.io/how-plex-is-doing-https-for-all-its-users/)
 
